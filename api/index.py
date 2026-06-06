@@ -215,7 +215,26 @@ def _vapi_stream(model: str, messages: list[dict]):
         temperature=0.3, max_tokens=300, stream=True,
     )
     for chunk in stream:
-        yield f"data: {chunk.model_dump_json()}\n\n"
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+        delta = {}
+        if getattr(choice.delta, "role", None):
+            delta["role"] = choice.delta.role
+        if getattr(choice.delta, "content", None) is not None:
+            delta["content"] = choice.delta.content
+        clean = {
+            "id": chunk.id,
+            "object": "chat.completion.chunk",
+            "created": chunk.created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": choice.finish_reason,
+            }],
+        }
+        yield f"data: {json.dumps(clean)}\n\n"
     yield "data: [DONE]\n\n"
 
 
