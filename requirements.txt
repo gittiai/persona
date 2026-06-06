@@ -1,0 +1,7 @@
+fastapi
+groq
+httpx
+jinja2
+pypdf
+python-multipart
+pydantic
