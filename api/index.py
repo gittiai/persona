@@ -26,6 +26,9 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 
 def _read_resume() -> str:
+    env_text = os.environ.get("RESUME_TEXT", "").strip()
+    if env_text:
+        return env_text
     pdf = DATA / "resume.pdf"
     txt = DATA / "resume.txt"
     if pdf.exists():
