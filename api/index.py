@@ -257,7 +257,7 @@ async def vapi_llm(request: Request):
             model=raw.get("model"),
             stream=bool(raw.get("stream", False)),
         )
-    model = body.model or LLM_MODEL
+    model = (body.model or LLM_MODEL).strip()
     messages = _vapi_messages(body)
     if body.stream:
         text = ""
