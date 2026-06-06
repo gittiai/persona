@@ -140,10 +140,11 @@ class ChatBody(BaseModel):
 
 class VapiMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
 
 
 class VapiBody(BaseModel):
+    model_config = {"extra": "ignore"}
     messages: list[VapiMessage] = []
     model: Optional[str] = None
     stream: bool = False
@@ -221,9 +222,22 @@ def _vapi_stream(model: str, messages: list[dict]):
 @app.post("/vapi/llm")
 @app.post("/vapi/llm/chat/completions")
 @app.post("/chat/completions")
-def vapi_llm(body: VapiBody):
+async def vapi_llm(request: Request):
     if not GROQ_API_KEY:
         return JSONResponse({"error": "GROQ_API_KEY not set"}, status_code=503)
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+    try:
+        body = VapiBody.model_validate(raw)
+    except Exception:
+        body = VapiBody(
+            messages=[VapiMessage(role=m.get("role", "user"), content=m.get("content"))
+                     for m in raw.get("messages", []) if isinstance(m, dict)],
+            model=raw.get("model"),
+            stream=bool(raw.get("stream", False)),
+        )
     model = body.model or LLM_MODEL
     messages = _vapi_messages(body)
     if body.stream:
