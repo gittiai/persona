@@ -260,9 +260,40 @@ async def vapi_llm(request: Request):
     model = body.model or LLM_MODEL
     messages = _vapi_messages(body)
     if body.stream:
-        return StreamingResponse(
-            _vapi_stream(model, messages), media_type="text/event-stream"
+        text = ""
+        chunk_id = "chatcmpl-vapi"
+        created = 0
+        finish_reason = "stop"
+        completion = _client().chat.completions.create(
+            model=model, messages=messages,
+            temperature=0.3, max_tokens=300, stream=True,
         )
+        for chunk in completion:
+            chunk_id = chunk.id
+            created = chunk.created
+            if chunk.choices:
+                d = chunk.choices[0].delta
+                if getattr(d, "content", None):
+                    text += d.content
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
+
+        def replay():
+            first = {
+                "id": chunk_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text},
+                             "finish_reason": None}],
+            }
+            last = {
+                "id": chunk_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            }
+            yield f"data: {json.dumps(first)}\n\n"
+            yield f"data: {json.dumps(last)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(replay(), media_type="text/event-stream")
     completion = _client().chat.completions.create(
         model=model, messages=messages, temperature=0.3, max_tokens=300,
     )
