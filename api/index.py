@@ -138,16 +138,6 @@ class ChatBody(BaseModel):
     history: list[dict] = []
 
 
-class VapiMessage(BaseModel):
-    role: str
-    content: Optional[str] = None
-
-
-class VapiBody(BaseModel):
-    model_config = {"extra": "ignore"}
-    messages: list[VapiMessage] = []
-    model: Optional[str] = None
-    stream: bool = False
 
 
 app = FastAPI()
@@ -201,11 +191,15 @@ def chat(body: ChatBody):
     return {"reply": completion.choices[0].message.content}
 
 
-def _vapi_messages(body: VapiBody) -> list[dict]:
+def _vapi_messages(raw_messages: list) -> list[dict]:
     msgs = [{"role": "system", "content": _system_prompt(voice=True)}]
-    for m in body.messages[-12:]:
-        if m.role in ("user", "assistant", "system") and m.content:
-            msgs.append({"role": m.role, "content": m.content})
+    for m in raw_messages[-12:]:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("user", "assistant", "system") and content:
+            msgs.append({"role": role, "content": content})
     return msgs
 
 
@@ -248,71 +242,73 @@ async def vapi_llm(request: Request):
         raw = await request.json()
     except Exception:
         raw = {}
-    try:
-        body = VapiBody.model_validate(raw)
-    except Exception:
-        body = VapiBody(
-            messages=[VapiMessage(role=m.get("role", "user"), content=m.get("content"))
-                     for m in raw.get("messages", []) if isinstance(m, dict)],
-            model=raw.get("model"),
-            stream=bool(raw.get("stream", False)),
-        )
-    model = (body.model or LLM_MODEL).strip()
-    messages = _vapi_messages(body)
-    if body.stream:
-        text = ""
-        chunk_id = "chatcmpl-vapi"
-        created = 0
-        finish_reason = "stop"
-        completion = _client().chat.completions.create(
-            model=model, messages=messages,
-            temperature=0.3, max_tokens=300, stream=True,
-        )
-        for chunk in completion:
-            chunk_id = chunk.id
-            created = chunk.created
-            if chunk.choices:
-                d = chunk.choices[0].delta
-                if getattr(d, "content", None):
-                    text += d.content
-                if chunk.choices[0].finish_reason:
-                    finish_reason = chunk.choices[0].finish_reason
+    if not isinstance(raw, dict):
+        raw = {}
+    raw_messages = raw.get("messages") or []
+    model = (raw.get("model") or LLM_MODEL).strip() or LLM_MODEL
+    stream = bool(raw.get("stream", False))
+    messages = _vapi_messages(raw_messages)
 
-        def replay():
-            first = {
-                "id": chunk_id, "object": "chat.completion.chunk",
-                "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text},
-                             "finish_reason": None}],
-            }
-            last = {
-                "id": chunk_id, "object": "chat.completion.chunk",
-                "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-            }
-            yield f"data: {json.dumps(first)}\n\n"
-            yield f"data: {json.dumps(last)}\n\n"
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(replay(), media_type="text/event-stream")
-    completion = _client().chat.completions.create(
-        model=model, messages=messages, temperature=0.3, max_tokens=300,
-    )
-    msg = completion.choices[0].message
-    return {
-        "id": completion.id,
-        "object": "chat.completion",
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "finish_reason": completion.choices[0].finish_reason,
-            "message": {"role": "assistant", "content": msg.content},
-        }],
-        "usage": {
-            "prompt_tokens": completion.usage.prompt_tokens,
-            "completion_tokens": completion.usage.completion_tokens,
-            "total_tokens": completion.usage.total_tokens,
-        } if completion.usage else {},
-    }
+    try:
+        if stream:
+            text = ""
+            chunk_id = "chatcmpl-vapi"
+            created = 0
+            finish_reason = "stop"
+            completion = _client().chat.completions.create(
+                model=model, messages=messages,
+                temperature=0.3, max_tokens=300, stream=True,
+            )
+            for chunk in completion:
+                chunk_id = chunk.id or chunk_id
+                created = chunk.created or created
+                if chunk.choices:
+                    d = chunk.choices[0].delta
+                    if getattr(d, "content", None):
+                        text += d.content
+                    if chunk.choices[0].finish_reason:
+                        finish_reason = chunk.choices[0].finish_reason
+
+            def replay():
+                first = {
+                    "id": chunk_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": text},
+                                 "finish_reason": None}],
+                }
+                last = {
+                    "id": chunk_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                }
+                yield f"data: {json.dumps(first)}\n\n"
+                yield f"data: {json.dumps(last)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(replay(), media_type="text/event-stream")
+
+        completion = _client().chat.completions.create(
+            model=model, messages=messages, temperature=0.3, max_tokens=300,
+        )
+        msg = completion.choices[0].message
+        return {
+            "id": completion.id,
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "finish_reason": completion.choices[0].finish_reason,
+                "message": {"role": "assistant", "content": msg.content},
+            }],
+            "usage": {
+                "prompt_tokens": completion.usage.prompt_tokens,
+                "completion_tokens": completion.usage.completion_tokens,
+                "total_tokens": completion.usage.total_tokens,
+            } if completion.usage else {},
+        }
+    except Exception as exc:
+        return JSONResponse(
+            {"error": type(exc).__name__, "detail": str(exc)[:300]}, status_code=500
+        )
 
 
 @app.get("/corpus")
