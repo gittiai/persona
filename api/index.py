@@ -5,7 +5,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from groq import Groq
@@ -200,27 +200,44 @@ def chat(body: ChatBody):
     return {"reply": completion.choices[0].message.content}
 
 
-@app.post("/vapi/llm")
-def vapi_llm(body: VapiBody):
-    if not GROQ_API_KEY:
-        return JSONResponse(
-            {"error": "GROQ_API_KEY not set"}, status_code=503
-        )
-    messages = [{"role": "system", "content": _system_prompt(voice=True)}]
+def _vapi_messages(body: VapiBody) -> list[dict]:
+    msgs = [{"role": "system", "content": _system_prompt(voice=True)}]
     for m in body.messages[-12:]:
         if m.role in ("user", "assistant", "system") and m.content:
-            messages.append({"role": m.role, "content": m.content})
+            msgs.append({"role": m.role, "content": m.content})
+    return msgs
+
+
+def _vapi_stream(model: str, messages: list[dict]):
+    stream = _client().chat.completions.create(
+        model=model, messages=messages,
+        temperature=0.3, max_tokens=300, stream=True,
+    )
+    for chunk in stream:
+        yield f"data: {chunk.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/vapi/llm")
+@app.post("/vapi/llm/chat/completions")
+@app.post("/chat/completions")
+def vapi_llm(body: VapiBody):
+    if not GROQ_API_KEY:
+        return JSONResponse({"error": "GROQ_API_KEY not set"}, status_code=503)
+    model = body.model or LLM_MODEL
+    messages = _vapi_messages(body)
+    if body.stream:
+        return StreamingResponse(
+            _vapi_stream(model, messages), media_type="text/event-stream"
+        )
     completion = _client().chat.completions.create(
-        model=body.model or LLM_MODEL,
-        messages=messages,
-        temperature=0.3,
-        max_tokens=300,
+        model=model, messages=messages, temperature=0.3, max_tokens=300,
     )
     msg = completion.choices[0].message
     return {
         "id": completion.id,
         "object": "chat.completion",
-        "model": body.model or LLM_MODEL,
+        "model": model,
         "choices": [{
             "index": 0,
             "finish_reason": completion.choices[0].finish_reason,
