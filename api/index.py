@@ -4,11 +4,11 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+from anthropic import Anthropic
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from groq import Groq
 from pydantic import BaseModel
 from pypdf import PdfReader
 
@@ -21,8 +21,8 @@ OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "")
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 CAL_BOOKING_URL = os.environ.get("CAL_BOOKING_URL", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+LLM_MODEL = (os.environ.get("LLM_MODEL") or "claude-haiku-4-5-20251001").strip()
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 def _read_resume() -> str:
@@ -123,21 +123,47 @@ def _system_prompt(voice: bool = False) -> str:
     )
 
 
-_groq: Optional[Groq] = None
+_client: Optional[Anthropic] = None
 
 
-def _client() -> Groq:
-    global _groq
-    if _groq is None:
-        _groq = Groq(api_key=GROQ_API_KEY)
-    return _groq
+def _claude() -> Anthropic:
+    global _client
+    if _client is None:
+        _client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _client
+
+
+def _system_blocks(voice: bool) -> list[dict]:
+    return [{
+        "type": "text",
+        "text": _system_prompt(voice=voice),
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _normalize_messages(raw_messages: list) -> list[dict]:
+    msgs = []
+    for m in raw_messages[-12:]:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("user", "assistant") and content:
+            msgs.append({"role": role, "content": content})
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
+    merged: list[dict] = []
+    for m in msgs:
+        if merged and merged[-1]["role"] == m["role"]:
+            merged[-1]["content"] += "\n\n" + m["content"]
+        else:
+            merged.append(dict(m))
+    return merged
 
 
 class ChatBody(BaseModel):
     message: str
     history: list[dict] = []
-
-
 
 
 app = FastAPI()
@@ -166,78 +192,45 @@ def health():
         "repos": len(_REPOS),
         "corpus_chars": len(_CORPUS),
         "resume_loaded": bool(_RESUME),
-        "groq_configured": bool(GROQ_API_KEY),
+        "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "booking_configured": bool(CAL_BOOKING_URL),
     }
 
 
 @app.post("/chat")
 def chat(body: ChatBody):
-    if not GROQ_API_KEY:
-        return JSONResponse(
-            {"error": "GROQ_API_KEY not set"}, status_code=503
+    if not ANTHROPIC_API_KEY:
+        return JSONResponse({"error": "ANTHROPIC_API_KEY not set"}, status_code=503)
+    history = [
+        {"role": t.get("role"), "content": t.get("content")}
+        for t in body.history if isinstance(t, dict)
+    ]
+    history.append({"role": "user", "content": body.message})
+    msgs = _normalize_messages(history)
+    if not msgs:
+        msgs = [{"role": "user", "content": body.message}]
+    try:
+        completion = _claude().messages.create(
+            model=LLM_MODEL,
+            max_tokens=600,
+            system=_system_blocks(voice=False),
+            messages=msgs,
+            temperature=0.3,
         )
-    messages = [{"role": "system", "content": _system_prompt(voice=False)}]
-    for turn in body.history[-12:]:
-        if turn.get("role") in ("user", "assistant") and turn.get("content"):
-            messages.append({"role": turn["role"], "content": turn["content"]})
-    messages.append({"role": "user", "content": body.message})
-    completion = _client().chat.completions.create(
-        model=LLM_MODEL,
-        messages=messages,
-        temperature=0.3,
-        max_tokens=600,
-    )
-    return {"reply": completion.choices[0].message.content}
-
-
-def _vapi_messages(raw_messages: list) -> list[dict]:
-    msgs = [{"role": "system", "content": _system_prompt(voice=True)}]
-    for m in raw_messages[-12:]:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role")
-        content = m.get("content")
-        if role in ("user", "assistant", "system") and content:
-            msgs.append({"role": role, "content": content})
-    return msgs
-
-
-def _vapi_stream(model: str, messages: list[dict]):
-    stream = _client().chat.completions.create(
-        model=model, messages=messages,
-        temperature=0.3, max_tokens=300, stream=True,
-    )
-    for chunk in stream:
-        choice = chunk.choices[0] if chunk.choices else None
-        if choice is None:
-            continue
-        delta = {}
-        if getattr(choice.delta, "role", None):
-            delta["role"] = choice.delta.role
-        if getattr(choice.delta, "content", None) is not None:
-            delta["content"] = choice.delta.content
-        clean = {
-            "id": chunk.id,
-            "object": "chat.completion.chunk",
-            "created": chunk.created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": delta,
-                "finish_reason": choice.finish_reason,
-            }],
-        }
-        yield f"data: {json.dumps(clean)}\n\n"
-    yield "data: [DONE]\n\n"
+    except Exception as exc:
+        return JSONResponse(
+            {"error": type(exc).__name__, "detail": str(exc)[:300]}, status_code=500
+        )
+    text = "".join(b.text for b in completion.content if getattr(b, "type", "") == "text")
+    return {"reply": text}
 
 
 @app.post("/vapi/llm")
 @app.post("/vapi/llm/chat/completions")
 @app.post("/chat/completions")
 async def vapi_llm(request: Request):
-    if not GROQ_API_KEY:
-        return JSONResponse({"error": "GROQ_API_KEY not set"}, status_code=503)
+    if not ANTHROPIC_API_KEY:
+        return JSONResponse({"error": "ANTHROPIC_API_KEY not set"}, status_code=503)
     try:
         raw = await request.json()
     except Exception:
@@ -245,40 +238,42 @@ async def vapi_llm(request: Request):
     if not isinstance(raw, dict):
         raw = {}
     raw_messages = raw.get("messages") or []
-    model = (raw.get("model") or LLM_MODEL).strip() or LLM_MODEL
     stream = bool(raw.get("stream", False))
-    messages = _vapi_messages(raw_messages)
+    messages = _normalize_messages(raw_messages)
+    if not messages:
+        messages = [{"role": "user", "content": "Hello"}]
+    model_id = LLM_MODEL
 
     try:
+        completion = _claude().messages.create(
+            model=model_id,
+            max_tokens=300,
+            system=_system_blocks(voice=True),
+            messages=messages,
+            temperature=0.3,
+        )
+        text = "".join(
+            b.text for b in completion.content if getattr(b, "type", "") == "text"
+        )
+        finish_reason = "stop"
+        if getattr(completion, "stop_reason", None) == "max_tokens":
+            finish_reason = "length"
+
         if stream:
-            text = ""
-            chunk_id = "chatcmpl-vapi"
+            chunk_id = f"chatcmpl-{completion.id}"
             created = 0
-            finish_reason = "stop"
-            completion = _client().chat.completions.create(
-                model=model, messages=messages,
-                temperature=0.3, max_tokens=300, stream=True,
-            )
-            for chunk in completion:
-                chunk_id = chunk.id or chunk_id
-                created = chunk.created or created
-                if chunk.choices:
-                    d = chunk.choices[0].delta
-                    if getattr(d, "content", None):
-                        text += d.content
-                    if chunk.choices[0].finish_reason:
-                        finish_reason = chunk.choices[0].finish_reason
 
             def replay():
                 first = {
                     "id": chunk_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": text},
+                    "created": created, "model": model_id,
+                    "choices": [{"index": 0,
+                                 "delta": {"role": "assistant", "content": text},
                                  "finish_reason": None}],
                 }
                 last = {
                     "id": chunk_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model,
+                    "created": created, "model": model_id,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 }
                 yield f"data: {json.dumps(first)}\n\n"
@@ -286,24 +281,21 @@ async def vapi_llm(request: Request):
                 yield "data: [DONE]\n\n"
             return StreamingResponse(replay(), media_type="text/event-stream")
 
-        completion = _client().chat.completions.create(
-            model=model, messages=messages, temperature=0.3, max_tokens=300,
-        )
-        msg = completion.choices[0].message
         return {
             "id": completion.id,
             "object": "chat.completion",
-            "model": model,
+            "model": model_id,
             "choices": [{
                 "index": 0,
-                "finish_reason": completion.choices[0].finish_reason,
-                "message": {"role": "assistant", "content": msg.content},
+                "finish_reason": finish_reason,
+                "message": {"role": "assistant", "content": text},
             }],
             "usage": {
-                "prompt_tokens": completion.usage.prompt_tokens,
-                "completion_tokens": completion.usage.completion_tokens,
-                "total_tokens": completion.usage.total_tokens,
-            } if completion.usage else {},
+                "prompt_tokens": getattr(completion.usage, "input_tokens", 0),
+                "completion_tokens": getattr(completion.usage, "output_tokens", 0),
+                "total_tokens": getattr(completion.usage, "input_tokens", 0) +
+                                getattr(completion.usage, "output_tokens", 0),
+            },
         }
     except Exception as exc:
         return JSONResponse(

@@ -1,5 +1,5 @@
 fastapi
-groq
+anthropic
 httpx
 jinja2
 pypdf
